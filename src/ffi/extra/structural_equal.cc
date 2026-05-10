@@ -174,6 +174,25 @@ class StructEqualHandler {
     static reflection::TypeAttrColumn custom_s_equal =
         reflection::TypeAttrColumn(reflection::type_attr::kSEqual);
 
+    // Non-recursive def boundary. When we enter a non-recursive def region we
+    // keep ``map_free_vars_`` on so that any FreeVar reachable through
+    // containers in the field's value (e.g. each ``Var`` in an ``Array<Var>``)
+    // can still bind. But once we are about to walk a FreeVar's OWN sub-fields
+    // (e.g. ``struct_info``, ``type_annotation``), we turn ``map_free_vars_``
+    // off so that nested free vars do not rebind — they must instead resolve
+    // against a binding established by an outer def region.
+    //
+    // ``non_recursive_def_active_`` stays on for the entire field value
+    // subtree (saved/restored at the field walk site below). It is consulted
+    // here to decide whether to clamp ``map_free_vars_`` to false during the
+    // FreeVar's field walk.
+    bool save_map_free_vars = map_free_vars_;
+    bool clamp_map_free_vars =
+        (structural_eq_hash_kind == kTVMFFISEqHashKindFreeVar) && non_recursive_def_active_;
+    if (clamp_map_free_vars) {
+      map_free_vars_ = false;
+    }
+
     bool success = true;
     if (custom_s_equal[type_info->type_index] == nullptr) {
       // We recursively compare the fields the object
@@ -184,12 +203,27 @@ class StructEqualHandler {
         reflection::FieldGetter getter(field_info);
         Any lhs_value = getter(lhs);
         Any rhs_value = getter(rhs);
-        // field is in def region, enable free var mapping
-        if (field_info->flags & kTVMFFIFieldFlagBitMaskSEqHashDef) {
-          bool allow_free_var = true;
-          std::swap(allow_free_var, map_free_vars_);
+        // Dispatch on the def-region flags.
+        //   - Recursive    : enable ``map_free_vars_`` for the whole subtree
+        //                    of this field's value, including nested FreeVars'
+        //                    sub-fields.
+        //   - NonRecursive : enable ``map_free_vars_`` only for the immediate
+        //                    FreeVar(s) reachable through this field; their
+        //                    own sub-fields are walked with ``map_free_vars_``
+        //                    clamped to false (the clamp lives in the
+        //                    ``CompareObject`` prologue above, gated by
+        //                    ``non_recursive_def_active_``).
+        constexpr int64_t kSEqHashDefAny = kTVMFFIFieldFlagBitMaskSEqHashDefRecursive |
+                                           kTVMFFIFieldFlagBitMaskSEqHashDefNonRecursive;
+        if (field_info->flags & kSEqHashDefAny) {
+          bool save_allow_free_var = map_free_vars_;
+          bool save_non_recursive = non_recursive_def_active_;
+          map_free_vars_ = true;
+          non_recursive_def_active_ =
+              (field_info->flags & kTVMFFIFieldFlagBitMaskSEqHashDefNonRecursive) != 0;
           success = CompareAny(lhs_value, rhs_value);
-          std::swap(allow_free_var, map_free_vars_);
+          map_free_vars_ = save_allow_free_var;
+          non_recursive_def_active_ = save_non_recursive;
         } else {
           success = CompareAny(lhs_value, rhs_value);
         }
@@ -212,16 +246,27 @@ class StructEqualHandler {
       // run custom equal function defined via __s_equal__ type attribute
       if (s_equal_callback_ == nullptr) {
         s_equal_callback_ = ffi::Function::FromTyped(
-            [this](AnyView lhs, AnyView rhs, bool def_region, AnyView field_name) {
+            // The third parameter is a ``TVMFFIFieldDefKind`` (typed as plain
+            // ``int`` on the wire to keep the FFI signature stable; legacy
+            // callers passing ``bool`` continue to compile and preserve their
+            // meaning via the implicit bool->int coercion: false -> 0
+            // (kTVMFFIFieldDefKindNone), true -> 1 (kTVMFFIFieldDefKindRecursive)).
+            [this](AnyView lhs, AnyView rhs, int def_kind, AnyView field_name) {
               // NOTE: we explicitly make field_name as AnyView to avoid copy overhead initially
               // and only cast to string if mismatch happens
               bool success = true;
-              if (def_region) {
-                bool allow_free_var = true;
-                std::swap(allow_free_var, map_free_vars_);
+              if (def_kind == kTVMFFIFieldDefKindRecursive ||
+                  def_kind == kTVMFFIFieldDefKindNonRecursive) {
+                bool save_allow_free_var = map_free_vars_;
+                bool save_non_recursive = non_recursive_def_active_;
+                map_free_vars_ = true;
+                non_recursive_def_active_ = (def_kind == kTVMFFIFieldDefKindNonRecursive);
                 success = CompareAny(lhs, rhs);
-                std::swap(allow_free_var, map_free_vars_);
+                map_free_vars_ = save_allow_free_var;
+                non_recursive_def_active_ = save_non_recursive;
               } else {
+                // kTVMFFIFieldDefKindNone (or any unknown value treated as None):
+                // not in a def region, leave map_free_vars_ as-is.
                 success = CompareAny(lhs, rhs);
               }
               if (!success) {
@@ -239,6 +284,14 @@ class StructEqualHandler {
       success = custom_s_equal[type_info->type_index]
                     .cast<ffi::Function>()(lhs, rhs, s_equal_callback_)
                     .cast<bool>();
+    }
+
+    // Restore the pre-clamp value of map_free_vars_ before deciding whether
+    // to bind a FreeVar pair below. The binding decision must use the value
+    // that the caller of CompareObject set — the clamp only affects this
+    // FreeVar's OWN sub-field walk.
+    if (clamp_map_free_vars) {
+      map_free_vars_ = save_map_free_vars;
     }
 
     if (success) {
@@ -415,6 +468,13 @@ class StructEqualHandler {
   }
   // whether we map free variables that are not defined
   bool map_free_vars_{false};
+  // Whether we are currently inside a non-recursive def region. Set when a
+  // field flagged ``kTVMFFIFieldFlagBitMaskSEqHashDefNonRecursive`` is being
+  // walked (or the custom-callback caller passed ``kTVMFFIFieldDefKindNonRecursive``).
+  // Consulted in CompareObject to clamp ``map_free_vars_`` to false when
+  // descending into a FreeVar's own sub-fields, while still allowing the
+  // FreeVar itself to bind in the post-pass.
+  bool non_recursive_def_active_{false};
   // whether we compare tensor data
   bool skip_tensor_content_{false};
   // the root lhs for result printing

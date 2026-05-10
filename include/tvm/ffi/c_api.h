@@ -858,11 +858,21 @@ typedef enum {
    */
   kTVMFFIFieldFlagBitMaskSEqHashIgnore = 1 << 3,
   /*!
-   * \brief The field enters a def region where var can be defined/matched.
+   * \brief The field enters a recursive def region.
+   *
+   * When equality / hashing first encounters a free var reachable through
+   * this field, the var binds. Sub-fields of that var (e.g. its
+   * struct_info / type_annotation / shape) remain in the def region — any
+   * free vars discovered transitively also bind as fresh defs at the same
+   * site.
+   *
+   * Use for "function-style" bindings where the value var and its shape
+   * vars are co-introduced (e.g. ``relax::FunctionNode::params``,
+   * ``tirx::AllocBufferNode::buffer``).
    *
    * This is an optional meta-data for structural eq/hash.
    */
-  kTVMFFIFieldFlagBitMaskSEqHashDef = 1 << 4,
+  kTVMFFIFieldFlagBitMaskSEqHashDefRecursive = 1 << 4,
   /*!
    * \brief The default_value_or_factory is a callable factory function () -> Any.
    *
@@ -922,6 +932,27 @@ typedef enum {
    * ``(field_addr_as_OpaquePtr, value_as_AnyView)``.
    */
   kTVMFFIFieldFlagBitSetterIsFunctionObj = 1 << 11,
+  /*!
+   * \brief The field enters a non-recursive def region.
+   *
+   * When equality / hashing first encounters a free var reachable through
+   * this field, the var binds. Sub-fields of that var are NOT in the def
+   * region — they are use references that must resolve against an outer
+   * binding. Free vars found in those sub-fields therefore do not rebind;
+   * if they are not already bound, equality fails (or hashing falls back
+   * to pointer identity).
+   *
+   * Use for "let-style" bindings where only the value var is introduced
+   * and its shape / type sub-fields refer to outer-scope vars
+   * (e.g. ``relax::BindingNode::var``, ``tirx::LetNode::var``,
+   * ``tirx::ForNode::loop_var``).
+   *
+   * This is an optional meta-data for structural eq/hash.
+   *
+   * \note Bit 1 << 12 is used here because bits 1 << 5 .. 1 << 11 are
+   *       already taken by other field flags above.
+   */
+  kTVMFFIFieldFlagBitMaskSEqHashDefNonRecursive = 1 << 12,
 #ifdef __cplusplus
 };
 #else
@@ -991,6 +1022,63 @@ typedef enum {
 };
 #else
 } TVMFFISEqHashKind;
+#endif
+
+/*!
+ * \brief Kind of def region a structural-equal / structural-hash callback is
+ *        currently in when visiting a field.
+ *
+ * The numeric values are stable: a legacy ``bool def_region`` argument that
+ * is implicitly coerced to ``int`` will land on ``kTVMFFIFieldDefKindNone``
+ * (false → 0) or ``kTVMFFIFieldDefKindRecursive`` (true → 1), preserving
+ * the meaning of any pre-existing call site that passes a bool.
+ */
+#ifdef __cplusplus
+enum TVMFFIFieldDefKind : int32_t {
+#else
+typedef enum {
+#endif
+  /*!
+   * \brief Not in a def region.
+   *
+   * Free vars reachable through this field are uses; they must already
+   * be bound by an enclosing def region or equality / hashing falls
+   * back to pointer identity.
+   */
+  kTVMFFIFieldDefKindNone = 0,
+  /*!
+   * \brief In a recursive def region.
+   *
+   * When we see a free var for the first time, we define the var, and
+   * the sub-fields of the var (e.g. its struct_info / type_annotation /
+   * shape) are also still in the def region — any free vars discovered
+   * inside those sub-fields are themselves treated as fresh defs at the
+   * same site.
+   *
+   * Use for "function-style" bindings where the value var and its shape
+   * vars are co-introduced (e.g. ``relax::FunctionNode::params``,
+   * ``tirx::AllocBufferNode::buffer``).
+   */
+  kTVMFFIFieldDefKindRecursive = 1,
+  /*!
+   * \brief In a non-recursive def region.
+   *
+   * When we see a free var for the first time, we define the var, but
+   * the sub-fields of the var are NOT in the def region — they are
+   * treated as use references that must resolve against an outer
+   * binding. Free vars found in those sub-fields therefore do not
+   * rebind; if they are not already bound, equality fails.
+   *
+   * Use for "let-style" bindings where only the value var is introduced
+   * and its shape / type sub-fields refer to outer-scope vars
+   * (e.g. ``relax::BindingNode::var``, ``tirx::LetNode::var``,
+   * ``tirx::ForNode::loop_var``).
+   */
+  kTVMFFIFieldDefKindNonRecursive = 2,
+#ifdef __cplusplus
+};
+#else
+} TVMFFIFieldDefKind;
 #endif
 
 /*!

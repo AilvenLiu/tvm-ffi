@@ -130,6 +130,21 @@ class StructuralHashHandler {
     static reflection::TypeAttrColumn custom_s_hash =
         reflection::TypeAttrColumn(reflection::type_attr::kSHash);
 
+    // Non-recursive def boundary (mirror of structural_equal.cc). When the
+    // current object is a FreeVar AND we are inside a non-recursive def
+    // region, clamp ``map_free_vars_`` to false during the FreeVar's own
+    // sub-field walk: nested free vars in those sub-fields then hash by
+    // pointer (matching use-semantics) instead of receiving fresh
+    // ``free_var_counter_`` slots. The clamp is restored before the
+    // FreeVar-level injection below so the FreeVar itself still gets its
+    // counter slot when ``map_free_vars_`` was on at the call site.
+    bool save_map_free_vars = map_free_vars_;
+    bool clamp_map_free_vars =
+        (structural_eq_hash_kind == kTVMFFISEqHashKindFreeVar) && non_recursive_def_active_;
+    if (clamp_map_free_vars) {
+      map_free_vars_ = false;
+    }
+
     // compute the hash value
     uint64_t hash_value = obj->GetTypeKeyHash();
     if (custom_s_hash[type_info->type_index] == nullptr) {
@@ -140,12 +155,23 @@ class StructuralHashHandler {
           // get the field value from both side
           reflection::FieldGetter getter(field_info);
           Any field_value = getter(obj);
-          // field is in def region, enable free var mapping
-          if (field_info->flags & kTVMFFIFieldFlagBitMaskSEqHashDef) {
-            bool allow_free_var = true;
-            std::swap(allow_free_var, map_free_vars_);
+          // Dispatch on the def-region flags (mirror of the equality side).
+          //   - Recursive    : map_free_vars_ stays on for the whole subtree.
+          //   - NonRecursive : map_free_vars_ on for the immediate FreeVar(s);
+          //                    clamped off when descending into a FreeVar's
+          //                    own sub-fields (the clamp lives in HashObject's
+          //                    prologue above, gated by non_recursive_def_active_).
+          constexpr int64_t kSEqHashDefAny = kTVMFFIFieldFlagBitMaskSEqHashDefRecursive |
+                                             kTVMFFIFieldFlagBitMaskSEqHashDefNonRecursive;
+          if (field_info->flags & kSEqHashDefAny) {
+            bool save_allow_free_var = map_free_vars_;
+            bool save_non_recursive = non_recursive_def_active_;
+            map_free_vars_ = true;
+            non_recursive_def_active_ =
+                (field_info->flags & kTVMFFIFieldFlagBitMaskSEqHashDefNonRecursive) != 0;
             hash_value = details::StableHashCombine(hash_value, HashAny(field_value));
-            std::swap(allow_free_var, map_free_vars_);
+            map_free_vars_ = save_allow_free_var;
+            non_recursive_def_active_ = save_non_recursive;
           } else {
             hash_value = details::StableHashCombine(hash_value, HashAny(field_value));
           }
@@ -154,12 +180,21 @@ class StructuralHashHandler {
     } else {
       if (s_hash_callback_ == nullptr) {
         s_hash_callback_ =
-            ffi::Function::FromTyped([this](AnyView val, uint64_t init_hash, bool def_region) {
-              if (def_region) {
-                bool allow_free_var = true;
-                std::swap(allow_free_var, map_free_vars_);
+            // The third parameter is a ``TVMFFIFieldDefKind`` (typed as plain
+            // ``int`` on the wire to keep the FFI signature stable; legacy
+            // callers passing ``bool`` continue to compile and preserve their
+            // meaning via the implicit bool->int coercion: false -> 0
+            // (kTVMFFIFieldDefKindNone), true -> 1 (kTVMFFIFieldDefKindRecursive)).
+            ffi::Function::FromTyped([this](AnyView val, uint64_t init_hash, int def_kind) {
+              if (def_kind == kTVMFFIFieldDefKindRecursive ||
+                  def_kind == kTVMFFIFieldDefKindNonRecursive) {
+                bool save_allow_free_var = map_free_vars_;
+                bool save_non_recursive = non_recursive_def_active_;
+                map_free_vars_ = true;
+                non_recursive_def_active_ = (def_kind == kTVMFFIFieldDefKindNonRecursive);
                 uint64_t hash_value = HashAny(val);
-                std::swap(allow_free_var, map_free_vars_);
+                map_free_vars_ = save_allow_free_var;
+                non_recursive_def_active_ = save_non_recursive;
                 return static_cast<int64_t>(details::StableHashCombine(init_hash, hash_value));
               } else {
                 // we explicitly bitcast the result from `uint64_t` to `int64_t`.
@@ -173,6 +208,13 @@ class StructuralHashHandler {
           custom_s_hash[type_info->type_index]
               .cast<ffi::Function>()(obj, static_cast<int64_t>(hash_value), s_hash_callback_)
               .cast<uint64_t>();
+    }
+
+    // Restore the pre-clamp value of map_free_vars_ before deciding the
+    // FreeVar-level hash injection: the clamp only suppresses binding inside
+    // the FreeVar's own sub-fields, not the FreeVar slot itself.
+    if (clamp_map_free_vars) {
+      map_free_vars_ = save_map_free_vars;
     }
 
     if (structural_eq_hash_kind == kTVMFFISEqHashKindFreeVar) {
@@ -318,6 +360,13 @@ class StructuralHashHandler {
   }
 
   bool map_free_vars_{false};
+  // Whether we are currently inside a non-recursive def region. Set when a
+  // field flagged ``kTVMFFIFieldFlagBitMaskSEqHashDefNonRecursive`` is being
+  // hashed (or the custom-callback caller passed ``kTVMFFIFieldDefKindNonRecursive``).
+  // Consulted in HashObject to clamp ``map_free_vars_`` to false when
+  // descending into a FreeVar's own sub-fields, so nested free vars hash by
+  // pointer rather than receiving fresh ``free_var_counter_`` slots.
+  bool non_recursive_def_active_{false};
   bool skip_tensor_content_{false};
   // free var counter.
   uint32_t free_var_counter_{0};
