@@ -371,6 +371,7 @@ cdef extern from "tvm_ffi_python_object.h":
     void TVMFFIPyTpDealloc(void** ptr_to_chandle, PyObject* wrapper) noexcept
     void TVMFFIPyInstallTypeSlots(PyObject* type_obj) noexcept
     object TVMFFIPyMakeRetObject(void* chandle, PyObject* cls_type)
+    bint TVMFFIPyWrapperIsUniqueForMove(PyObject* wrapper) noexcept
 
 
 cdef extern from "tvm_ffi_python_helpers.h":

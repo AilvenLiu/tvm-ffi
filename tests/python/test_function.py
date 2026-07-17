@@ -229,6 +229,29 @@ def test_rvalue_ref() -> None:
     check_callback_move()
 
 
+def test_move_if_unique() -> None:
+    discard = tvm_ffi.convert(lambda _: None)
+
+    shared = tvm_ffi.convert([1, 2])
+    alias = shared
+    assert shared._move_if_unique() is shared
+    discard(shared._move_if_unique())
+    assert shared.__ctypes_handle__().value is not None
+    assert alias is shared
+
+    del alias
+    if hasattr(sys, "_is_gil_enabled") and not sys._is_gil_enabled():
+        candidate = shared._move_if_unique()
+        assert candidate is shared
+        discard(candidate)
+        assert shared.__ctypes_handle__().value is not None
+    else:
+        candidate = shared._move_if_unique()
+        assert isinstance(candidate, tvm_ffi.core.ObjectRValueRef)
+        discard(candidate)
+        assert shared.__ctypes_handle__().value is None
+
+
 def test_echo_with_opaque_object() -> None:
     class MyObject:
         def __init__(self, value: Any) -> None:

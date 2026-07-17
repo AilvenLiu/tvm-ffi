@@ -48,6 +48,21 @@
 #define Py_TPFLAGS_MANAGED_DICT 0
 #endif
 
+/*! \brief Whether a Python-visible ``_move_if_unique`` call has one external wrapper owner.
+ *
+ * The bound-method call and Cython argument wrapper each temporarily own a reference, so a
+ * classic-GIL build observes three references when the caller has exactly one. Free-threaded
+ * builds conservatively return false: ``Py_REFCNT`` does not establish exclusive access there,
+ * and an lvalue preserves correctness at the cost of skipping the move optimization.
+ */
+TVM_FFI_INLINE bool TVMFFIPyWrapperIsUniqueForMove(PyObject* wrapper) {
+#ifdef Py_GIL_DISABLED
+  return false;
+#else
+  return Py_REFCNT(wrapper) == 3;
+#endif
+}
+
 #include <atomic>
 #include <cassert>
 #include <cstring>

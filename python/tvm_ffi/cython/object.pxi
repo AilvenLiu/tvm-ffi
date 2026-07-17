@@ -335,6 +335,27 @@ class Object(CObject, metaclass=_ObjectSlotsMeta):
         """
         return ObjectRValueRef(self)
 
+    def _move_if_unique(self):
+        """Move this object only when its Python wrapper is uniquely referenced.
+
+        Returns an rvalue reference when this wrapper has exactly one Python
+        reference.  Otherwise, returns the object itself so FFI calls receive
+        it as an lvalue and retain the original wrapper.
+
+        Returns
+        -------
+        ObjectRValueRef or Object
+            An rvalue reference for a unique wrapper, or ``self`` when shared.
+
+        Notes
+        -----
+        Free-threaded Python conservatively returns ``self`` because its
+        reference count does not establish exclusive access.
+        """
+        if TVMFFIPyWrapperIsUniqueForMove(<PyObject*>self):
+            return ObjectRValueRef(self)
+        return self
+
     def __move_handle_from__(self, other: CObject) -> None:
         """Steal the FFI handle from ``other``.
 
